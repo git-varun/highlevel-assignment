@@ -124,8 +124,8 @@ export async function submitBulkMove(pool, ws, idempotencyKey, body) {
 
     // ON CONFLICT stays as the hard guarantee even though the advisory lock makes a
     // conflict here practically impossible: never rely on a single layer.
-    // created_at = clock_timestamp() (wall clock NOW, after the lock), not now() (transaction
-    // START): FIFO order must equal the order submits were actually accepted.
+    // created_at = clock_timestamp() (the moment of insert, after the lock), not now()
+    // (transaction START): created_at then reflects the real order submits were accepted.
     const ins = await c.query(
       `INSERT INTO bulk_jobs (workspace_id, idempotency_key, request_hash, target_stage_id, filter, created_at)
        SELECT $1, $2, $3, $4, $5, clock_timestamp()
@@ -148,45 +148,35 @@ export async function submitBulkMove(pool, ws, idempotencyKey, body) {
     }
 
     const jobId = ins.rows[0].id;
-
-    // Cheap pre-check only — NO snapshot here. The real item list is frozen when the job
-    // STARTS (buildSnapshot), so a queued job sees the results of the jobs ahead of it.
-    // LIMIT cap+1 inside the subquery: we stop counting as soon as we know it's too many.
     const { where, params } = filterSql(ws, req.filter, req.targetStageId);
-    const { rows: [{ n }] } = await c.query(
-      `SELECT count(*)::int AS n FROM (SELECT 1 FROM opportunities WHERE ${where} LIMIT ${MAX_JOB_SIZE + 1}) s`,
-      params,
+
+    // The snapshot, taken NOW — at submission — because the job must change exactly the
+    // deals the user saw and approved, nothing they never selected. ONE statement → one
+    // consistent view of the data even under Read Committed. LIMIT cap+1 detects
+    // "too many" without counting the whole match set.
+    const snap = await c.query(
+      `INSERT INTO bulk_job_items (job_id, opportunity_id, from_stage_id, expected_version)
+       SELECT $${params.length + 1}, id, stage_id, version
+       FROM opportunities WHERE ${where}
+       ORDER BY id LIMIT ${MAX_JOB_SIZE + 1}`,
+      [...params, jobId],
     );
-    if (n > MAX_JOB_SIZE) {
+    if (snap.rowCount > MAX_JOB_SIZE) {
       // Throwing rolls back the job row too, so the key is NOT burned: the client can
       // narrow the filter and retry with the same key.
       throw unprocessable('TOO_MANY_MATCHES', `Filter matches more than ${MAX_JOB_SIZE} opportunities; narrow it`, { max: MAX_JOB_SIZE });
     }
-    await c.query('UPDATE bulk_jobs SET estimated_count = $2 WHERE id = $1', [jobId, n]);
+
+    // Empty match set: nothing to do, so the job is complete at birth (honest 100% of 0).
+    await c.query(
+      `UPDATE bulk_jobs SET total_count = $2,
+         status = CASE WHEN $2 = 0 THEN 'completed' ELSE 'queued' END,
+         finished_at = CASE WHEN $2 = 0 THEN now() END
+       WHERE id = $1`,
+      [jobId, snap.rowCount],
+    );
     return { job: await readJob(c, ws, jobId), replayed: false };
   });
-}
-
-/**
- * Freeze the item list. Called by the worker in the job's FIRST chunk-sized step, inside a
- * transaction that already holds the fenced job-row lock. All-or-nothing: if the worker
- * dies mid-snapshot the INSERT rolls back and the next owner simply snapshots again.
- * Returns { total } or { tooMany: true }.
- */
-export async function buildSnapshot(c, job) {
-  const { rows: [j] } = await c.query('SELECT filter, target_stage_id FROM bulk_jobs WHERE id = $1', [job.id]);
-  const { where, params } = filterSql(job.workspace_id, j.filter, j.target_stage_id);
-  // ONE statement → one consistent view of the data even under Read Committed.
-  const snap = await c.query(
-    `INSERT INTO bulk_job_items (job_id, opportunity_id, from_stage_id, expected_version)
-     SELECT $${params.length + 1}, id, stage_id, version
-     FROM opportunities WHERE ${where}
-     ORDER BY id LIMIT ${MAX_JOB_SIZE + 1}`,
-    [...params, job.id],
-  );
-  if (snap.rowCount > MAX_JOB_SIZE) return { tooMany: true };
-  await c.query('UPDATE bulk_jobs SET total_count = $2, snapshot_at = now() WHERE id = $1', [job.id, snap.rowCount]);
-  return { total: snap.rowCount };
 }
 
 /**
@@ -198,43 +188,30 @@ async function readJob(q, ws, id) {
   const { rows } = await q.query(
     `SELECT id, status, target_stage_id, filter, total_count, applied_count, skipped_count,
             attempt, max_attempts, error, created_at, started_at, finished_at,
-            heartbeat_at, last_progress_at, lease_until, estimated_count, snapshot_at,
+            heartbeat_at, last_progress_at, lease_until,
             (status = 'running' AND lease_until < now()) AS lease_expired,
-            extract(epoch FROM now() - heartbeat_at)::int AS seconds_since_heartbeat,
-            -- FIFO position: unfinished jobs of this workspace accepted before this one
-            CASE WHEN status = 'queued' THEN (
-              SELECT count(*)::int FROM bulk_jobs a
-              WHERE a.workspace_id = j.workspace_id AND a.status IN ('queued', 'running')
-                AND (a.created_at, a.id) < (j.created_at, j.id)) END AS jobs_ahead
-     FROM bulk_jobs j WHERE id = $1 AND workspace_id = $2`,
+            extract(epoch FROM now() - heartbeat_at)::int AS seconds_since_heartbeat
+     FROM bulk_jobs WHERE id = $1 AND workspace_id = $2`,
     [id, ws],
   );
   const j = rows[0];
   if (!j) return null;
   const done = j.applied_count + j.skipped_count;
-  const snapshotted = j.snapshot_at !== null;
   return {
     id: j.id,
     status: j.status,
     // 'stalled' = the owner stopped heartbeating; the job will be reclaimed. Not the same as failed.
-    health: j.status === 'running' && j.lease_expired ? 'stalled'
-      : j.status === 'running' && !snapshotted ? 'snapshotting' : j.status,
-    // 0 = next in line for this workspace. Lets a user see "waiting", not "broken".
-    jobsAhead: j.jobs_ahead,
+    health: j.status === 'running' && j.lease_expired ? 'stalled' : j.status,
     targetStageId: j.target_stage_id,
     filter: j.filter,
     progress: {
-      // Until the job starts, the real total is unknown: report the submit-time estimate,
-      // clearly labelled, rather than a number that pretends to be exact.
-      estimatedTotal: j.estimated_count,
-      total: snapshotted ? j.total_count : null,
+      total: j.total_count,
       applied: j.applied_count,
       skipped: j.skipped_count,
-      pending: snapshotted ? j.total_count - done : null,
+      pending: j.total_count - done,
       // floor, never round: 99.996% must not display as 100% while work remains
-      percent: !snapshotted ? 0 : j.total_count === 0 ? 100 : Math.floor((done / j.total_count) * 10_000) / 100,
+      percent: j.total_count === 0 ? 100 : Math.floor((done / j.total_count) * 10_000) / 100,
     },
-    snapshotAt: j.snapshot_at,
     attempt: j.attempt,
     maxAttempts: j.max_attempts,
     error: j.error,

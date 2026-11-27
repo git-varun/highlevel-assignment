@@ -4,7 +4,7 @@ import { createPool } from '../db.js';
 import { TokenBucket } from './tokenBucket.js';
 import { withRetry, sleep, isTransient } from './retry.js';
 import {
-  claimJob, snapshotJob, runChunk, heartbeat, completeJob, releaseJob, reapExhausted,
+  claimJob, runChunk, heartbeat, completeJob, releaseJob, reapExhausted,
   LostOwnershipError, LEASE_SECONDS,
 } from './jobs.js';
 
@@ -25,12 +25,6 @@ export function startWorker(pool, { id = `${os.hostname()}:${process.pid}`, log 
     log(`[worker ${id}] claimed job ${job.id} attempt=${job.attempt} failures=${job.failures} resume_from=${job.cursor_id}`);
 
     try {
-      if (!job.snapshot_at) {
-        const s = await withRetry(() => snapshotJob(pool, job));
-        if (s.failed) { log(`[worker ${id}] job ${job.id} failed at start: too many matches`); return; }
-        log(`[worker ${id}] job ${job.id} snapshot: ${s.total} deals`);
-        lastRenew = Date.now();
-      }
       while (true) {
         if (stopping) {
           await releaseJob(pool, job, { graceful: true });
