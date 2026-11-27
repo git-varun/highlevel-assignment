@@ -8,6 +8,9 @@ const TRANSIENT = new Set([
   '55P03', // lock_not_available (our lock_timeout)
   '57014', // query_canceled (our statement_timeout)
   '57P01', // admin_shutdown (DB restarting)
+  '57P02', // crash_shutdown
+  '57P03', // cannot_connect_now (DB starting up)
+  '25P03', // idle_in_transaction_session_timeout — OUR guard killed a stalled transaction
   '08000', '08003', '08006', // connection exceptions
   'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE',
 ]);

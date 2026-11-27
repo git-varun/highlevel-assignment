@@ -23,6 +23,8 @@ export const unprocessable = (code, msg, details) => new HttpError(422, code, ms
 const PG_MAP = {
   '23503': () => unprocessable('INVALID_REFERENCE', 'Referenced record does not exist in this workspace'),
   '22P02': () => badRequest('Malformed value'),
+  '22003': () => badRequest('Numeric value out of range'),
+  '23514': () => unprocessable('CONSTRAINT_VIOLATION', 'Value violates a data constraint'),
   '55P03': () => new HttpError(503, 'BUSY', 'Record is busy (being updated by a bulk job); retry shortly'),
   '57014': () => new HttpError(503, 'TIMEOUT', 'Query timed out; retry shortly'),
 };
@@ -36,8 +38,12 @@ export function errorHandler(err, req, res, _next) {
     else if (mapped.status === 503) res.set('Retry-After', '1');
     return res.status(mapped.status).json({ error: { code: mapped.code, message: mapped.message, details: mapped.details } });
   }
-  if (err.type === 'entity.parse.failed') {
-    return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } });
+  // body-parser errors (bad JSON 400, body too large 413, bad charset/encoding 415) carry
+  // their own 4xx status and expose=true. They are client errors — never a 500.
+  if (err.expose && err.status >= 400 && err.status < 500) {
+    const code = err.type === 'entity.too.large' ? 'PAYLOAD_TOO_LARGE' : 'BAD_REQUEST';
+    const message = err.type === 'entity.parse.failed' ? 'Invalid JSON body' : err.message;
+    return res.status(err.status).json({ error: { code, message } });
   }
   console.error(`[api] ${req.method} ${req.originalUrl}`, err);
   res.status(500).json({ error: { code: 'INTERNAL', message: 'Internal error' } });

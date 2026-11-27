@@ -27,8 +27,15 @@ const txGuards = async (c, statementTimeout) => {
  * Candidates:
  *   - queued and past its backoff time, or
  *   - running with an expired lease (owner crashed) → costs one failure.
- * NOT EXISTS: skip workspaces that already have a live running job — one running job per
- * workspace bounds the load a tenant's bulk work puts on its own interactive traffic.
+ * One running job per workspace (bounds the load a tenant's bulk work puts on its own
+ * interactive traffic):
+ *   - a QUEUED job is claimable only if its workspace has NO running job at all —
+ *     live OR expired. An expired running job is not "gone": it still holds the
+ *     workspace's running slot (partial unique index) until it is reclaimed or reaped.
+ *   - so the only way past an expired running job is to reclaim THAT job (2nd branch).
+ *   (Checking only LIVE running jobs here caused a livelock: a queued job looked
+ *   claimable, its UPDATE hit the unique index every poll, and with LIMIT 1 it starved
+ *   the whole queue — every workspace.)
  * The partial unique index is the hard guarantee if two claims race past this check.
  * FOR UPDATE SKIP LOCKED: concurrent workers skip rows another worker is claiming
  * instead of waiting, so two workers never claim the same job.
@@ -41,12 +48,10 @@ export async function claimJob(pool, workerId) {
          FROM bulk_jobs j
          -- Reclaiming a crashed job costs one failure, so it needs failures + 1 < max.
          -- The reaper takes exactly the complement (failures + 1 >= max): no overlap, no race.
-         WHERE ( (j.status = 'queued'  AND j.next_run_at <= now() AND j.failures < j.max_attempts)
+         WHERE ( (j.status = 'queued'  AND j.next_run_at <= now() AND j.failures < j.max_attempts
+                  AND NOT EXISTS (SELECT 1 FROM bulk_jobs r
+                                  WHERE r.workspace_id = j.workspace_id AND r.status = 'running'))
               OR (j.status = 'running' AND j.lease_until < now() AND j.failures + 1 < j.max_attempts) )
-           AND NOT EXISTS (
-             SELECT 1 FROM bulk_jobs r
-             WHERE r.workspace_id = j.workspace_id AND r.status = 'running'
-               AND r.id <> j.id AND r.lease_until >= now())
          ORDER BY j.created_at
          LIMIT 1
          FOR UPDATE SKIP LOCKED
@@ -86,7 +91,9 @@ export async function claimJob(pool, workerId) {
  */
 export async function runChunk(pool, job, chunkSize) {
   return withTransaction(pool, async (c) => {
-    await txGuards(c, '10s');
+    // 5s: well under the lease (30s) and under the 9s shutdown deadline, so on SIGTERM a
+    // chunk always finishes or fails before the process is force-killed.
+    await txGuards(c, '5s');
 
     // a) fence
     const fence = await c.query(
@@ -192,7 +199,8 @@ export async function completeJob(pool, job) {
   );
   if (!rows.length) {
     // Either we lost ownership, or the invariant is broken. Distinguish, never guess.
-    const { rows: [j] } = await pool.query('SELECT attempt, status FROM bulk_jobs WHERE id = $1', [job.id]);
+    const { rows: [j] } = await pool.query(
+      'SELECT attempt, status FROM bulk_jobs WHERE id = $1 AND workspace_id = $2', [job.id, job.workspace_id]);
     if (j.attempt !== job.attempt || j.status !== 'running') throw new LostOwnershipError(job.id);
     await failJob(pool, job, 'completion check failed: counters do not match items');
     return false;
@@ -210,7 +218,8 @@ export async function releaseJob(pool, job, { graceful, error }) {
          finished_at = CASE WHEN NOT $3 AND failures + 1 >= max_attempts THEN now() END,
          next_run_at = now() + CASE WHEN $3 THEN interval '0'
                        ELSE make_interval(secs => LEAST(300, 2 ^ failures * 2)) END,
-         error = $4, lease_until = NULL, worker_id = NULL
+         -- graceful hand-off keeps the last error message (useful history); an error sets it
+         error = CASE WHEN $3 THEN error ELSE $4 END, lease_until = NULL, worker_id = NULL
      WHERE id = $1 AND attempt = $2 AND status = 'running'`,
     [job.id, job.attempt, graceful, error ?? null],
   );
@@ -219,7 +228,7 @@ export async function releaseJob(pool, job, { graceful, error }) {
 export async function failJob(pool, job, error) {
   await pool.query(
     `UPDATE bulk_jobs SET status = 'failed', error = $3, finished_at = now(), lease_until = NULL, worker_id = NULL
-     WHERE id = $1 AND attempt = $2`,
+     WHERE id = $1 AND attempt = $2 AND status = 'running'`,
     [job.id, job.attempt, error],
   );
 }

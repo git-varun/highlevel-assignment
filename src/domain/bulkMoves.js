@@ -1,7 +1,8 @@
-// Bulk move: submit (idempotent, snapshotting) and progress read.
+// Bulk move: submit (idempotent, snapshot at submission) and progress read.
 import { createHash } from 'node:crypto';
 import { withTransaction } from '../db.js';
 import { badRequest, notFound, unprocessable, tooManyRequests } from '../api/errors.js';
+import { canonicalMoney, moneyCents } from './money.js';
 
 export const MAX_JOB_SIZE = Number(process.env.MAX_JOB_SIZE ?? 50_000);
 // Queue-flood guard: max unfinished (queued + running) jobs per workspace.
@@ -10,7 +11,8 @@ export const MAX_PENDING_JOBS = Number(process.env.MAX_PENDING_JOBS ?? 10);
 const FILTER_KEYS = ['stageId', 'ownerId', 'status', 'valueMin', 'valueMax', 'createdFrom', 'createdTo'];
 const STATUSES = ['open', 'won', 'lost', 'abandoned'];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MONEY_RE = /^\d+(\.\d{1,2})?$/;
+// Date or full ISO timestamp, as a string (new Date(12345) or "2024" must not sneak through).
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(T[\d:.]+(Z|[+-]\d{2}:\d{2})?)?$/;
 
 /**
  * Validate + canonicalise the request. The canonical form is what we hash, so
@@ -21,7 +23,8 @@ export function normalizeRequest(body) {
   const { targetStageId, filter = {} } = body;
 
   if (!Number.isSafeInteger(targetStageId) || targetStageId <= 0) throw badRequest('targetStageId must be a positive integer');
-  if (typeof filter !== 'object' || Array.isArray(filter)) throw badRequest('filter must be an object');
+  // typeof null === 'object' in JS — reject it explicitly or Object.keys(null) throws a 500.
+  if (filter === null || typeof filter !== 'object' || Array.isArray(filter)) throw badRequest('filter must be an object');
 
   const unknown = Object.keys(filter).filter((k) => !FILTER_KEYS.includes(k));
   if (unknown.length) throw badRequest(`Unknown filter keys: ${unknown.join(', ')}`); // typo'd filter must not silently match everything
@@ -32,7 +35,8 @@ export function normalizeRequest(body) {
     f.stageId = filter.stageId;
   }
   if (filter.ownerId != null) {
-    if (!UUID_RE.test(filter.ownerId)) throw badRequest('filter.ownerId must be a UUID');
+    // typeof check first: RegExp.test(['<uuid>']) coerces the array to a string and passes.
+    if (typeof filter.ownerId !== 'string' || !UUID_RE.test(filter.ownerId)) throw badRequest('filter.ownerId must be a UUID');
     f.ownerId = filter.ownerId.toLowerCase();
   }
   if (filter.status != null) {
@@ -41,18 +45,19 @@ export function normalizeRequest(body) {
   }
   for (const k of ['valueMin', 'valueMax']) {
     if (filter[k] != null) {
-      if (!MONEY_RE.test(String(filter[k]))) throw badRequest(`filter.${k} must be a non-negative amount`);
-      f[k] = Number(filter[k]).toFixed(2);   // "100" and "100.00" → same canonical value
+      const m = canonicalMoney(filter[k]);  // "100" and "100.00" → same canonical value, no floats
+      if (!m) throw badRequest(`filter.${k} must be a non-negative amount (max 12 digits, 2 decimals)`);
+      f[k] = m;
     }
   }
   for (const k of ['createdFrom', 'createdTo']) {
     if (filter[k] != null) {
-      const d = new Date(filter[k]);
-      if (Number.isNaN(d.getTime())) throw badRequest(`filter.${k} must be an ISO date`);
+      const d = typeof filter[k] === 'string' && ISO_DATE_RE.test(filter[k]) ? new Date(filter[k]) : null;
+      if (!d || Number.isNaN(d.getTime())) throw badRequest(`filter.${k} must be an ISO date string`);
       f[k] = d.toISOString();
     }
   }
-  if (f.valueMin && f.valueMax && Number(f.valueMin) > Number(f.valueMax)) throw badRequest('valueMin > valueMax');
+  if (f.valueMin && f.valueMax && moneyCents(f.valueMin) > moneyCents(f.valueMax)) throw badRequest('valueMin > valueMax');
   if (f.createdFrom && f.createdTo && f.createdFrom > f.createdTo) throw badRequest('createdFrom > createdTo');
 
   // Fixed key order → deterministic JSON → deterministic hash.
@@ -113,6 +118,11 @@ export async function submitBulkMove(pool, ws, idempotencyKey, body) {
       return { job: await readJob(c, ws, prior.rows[0].id), replayed: true };
     }
 
+    // Validate before the cap, so a bad request gets the error that's actually about IT
+    // (422 invalid stage), not a 429 that would invite the client to retry a hopeless request.
+    const stage = await c.query('SELECT 1 FROM stages WHERE id = $1 AND workspace_id = $2', [req.targetStageId, ws]);
+    if (!stage.rowCount) throw unprocessable('INVALID_STAGE', 'targetStageId does not exist in this workspace');
+
     const { rows: [{ pending }] } = await c.query(
       `SELECT count(*)::int AS pending FROM bulk_jobs
        WHERE workspace_id = $1 AND status IN ('queued', 'running')`, [ws]);
@@ -125,7 +135,8 @@ export async function submitBulkMove(pool, ws, idempotencyKey, body) {
     // ON CONFLICT stays as the hard guarantee even though the advisory lock makes a
     // conflict here practically impossible: never rely on a single layer.
     // created_at = clock_timestamp() (the moment of insert, after the lock), not now()
-    // (transaction START): created_at then reflects the real order submits were accepted.
+    // (transaction START), so created_at is the true acceptance time. The claim query's
+    // oldest-first preference and any audit/support timeline read it that way.
     const ins = await c.query(
       `INSERT INTO bulk_jobs (workspace_id, idempotency_key, request_hash, target_stage_id, filter, created_at)
        SELECT $1, $2, $3, $4, $5, clock_timestamp()
@@ -172,8 +183,8 @@ export async function submitBulkMove(pool, ws, idempotencyKey, body) {
       `UPDATE bulk_jobs SET total_count = $2,
          status = CASE WHEN $2 = 0 THEN 'completed' ELSE 'queued' END,
          finished_at = CASE WHEN $2 = 0 THEN now() END
-       WHERE id = $1`,
-      [jobId, snap.rowCount],
+       WHERE id = $1 AND workspace_id = $3`,
+      [jobId, snap.rowCount, ws],
     );
     return { job: await readJob(c, ws, jobId), replayed: false };
   });

@@ -8,12 +8,13 @@ export async function verifyJob(pool, jobId) {
   const items = await q(`SELECT count(*)::int total,
       count(*) FILTER (WHERE status = 'pending')::int pending,
       count(*) FILTER (WHERE status = 'applied')::int applied,
-      count(*) FILTER (WHERE status LIKE 'skipped%')::int skipped
+      count(*) FILTER (WHERE status = 'skipped_modified')::int skipped
     FROM bulk_job_items WHERE job_id = $1`);
   const tr = await q(`SELECT count(*)::int n, count(DISTINCT opportunity_id)::int distinct_opps
     FROM stage_transitions WHERE job_id = $1`);
   // Applied deals must sit in the target stage, unless something moved them AFTER this job
-  // did — a user, or a later bulk job (jobs chain: B may legitimately move A's results).
+  // did: a user, or a bulk job submitted after this one finished (its submit-time snapshot
+  // then legitimately contains deals this job moved).
   const misplaced = await q(`SELECT count(*)::int n FROM bulk_job_items i
     JOIN bulk_jobs j ON j.id = i.job_id JOIN opportunities o ON o.id = i.opportunity_id
     WHERE i.job_id = $1 AND i.status = 'applied' AND o.stage_id <> j.target_stage_id

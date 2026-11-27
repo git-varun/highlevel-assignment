@@ -2,6 +2,10 @@
 import { Router } from 'express';
 import { badRequest } from '../errors.js';
 import { createOpportunity, moveOpportunity, listByStage } from '../../domain/opportunities.js';
+import { canonicalMoney } from '../../domain/money.js';
+
+const STATUSES = ['open', 'won', 'lost', 'abandoned'];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const posInt = (v, field) => {
   const n = Number(v);
@@ -14,11 +18,13 @@ export function opportunitiesRouter(pool) {
 
   r.post('/', async (req, res) => {
     const { name, value, stageId, ownerId, status } = req.body ?? {};
-    if (typeof name !== 'string' || !name.trim()) throw badRequest('name is required');
-    if (!/^\d+(\.\d{1,2})?$/.test(String(value))) throw badRequest('value must be a non-negative amount, max 2 decimals');
-    if (typeof ownerId !== 'string') throw badRequest('ownerId is required');
+    if (typeof name !== 'string' || !name.trim() || name.length > 500) throw badRequest('name is required (max 500 chars)');
+    const money = canonicalMoney(value);
+    if (!money) throw badRequest('value must be a non-negative amount (max 12 digits, 2 decimals)');
+    if (typeof ownerId !== 'string' || !UUID_RE.test(ownerId)) throw badRequest('ownerId must be a UUID');
+    if (status !== undefined && !STATUSES.includes(status)) throw badRequest(`status must be one of ${STATUSES.join('/')}`);
     const opp = await createOpportunity(pool, req.workspaceId, {
-      name: name.trim(), value: String(value), stageId: posInt(stageId, 'stageId'), ownerId, status,
+      name: name.trim(), value: money, stageId: posInt(stageId, 'stageId'), ownerId, status,
     });
     res.status(201).json(opp);
   });
