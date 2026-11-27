@@ -150,6 +150,8 @@ Separate processes, open-loop load, settled baseline. Results and hardware: [BEN
 
 ## Configuration
 
+All variables are optional. [`.env.example`](.env.example) lists every one with its default: copy it to `.env` and run with `node --env-file=.env …`.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | `postgres://postgres:postgres@localhost:5432/bulkmove` | Database |
