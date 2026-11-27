@@ -25,7 +25,7 @@ const PG_MAP = {
   '22P02': () => badRequest('Malformed value'),
   '22003': () => badRequest('Numeric value out of range'),
   '23514': () => unprocessable('CONSTRAINT_VIOLATION', 'Value violates a data constraint'),
-  '55P03': () => new HttpError(503, 'BUSY', 'Record is busy (being updated by a bulk job); retry shortly'),
+  '55P03': () => new HttpError(503, 'BUSY', 'Resource is busy (locked by another operation); retry shortly'),
   '57014': () => new HttpError(503, 'TIMEOUT', 'Query timed out; retry shortly'),
 };
 

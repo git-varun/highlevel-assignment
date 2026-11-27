@@ -125,6 +125,31 @@ test('submits in one workspace are serialised; other workspaces are not blocked'
   }
 });
 
+// Mechanism: lock_timeout on the submit lock. Without it, a burst in one workspace parks
+// every API connection on the lock and starves all other tenants.
+test('a submit stuck behind a long-held workspace lock fails fast with 503, not a hung connection', async () => {
+  const L = await makeWorkspace({ deals: 20 });
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    await c.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`bulk-submit:${L.ws}`]);
+    const t0 = Date.now();
+    const res = await submit(L.ws, { targetStageId: L.stages[1], filter: { stageId: L.stages[0] } }, 'busy-key');
+    const waited = Date.now() - t0;
+    assert.equal(res.status, 503);
+    assert.equal(res.body.error.code, 'BUSY');
+    assert.equal(res.headers['retry-after'], '1');
+    assert.ok(waited >= 1900 && waited < 5000, `gave up after the 2s lock_timeout (waited ${waited}ms)`);
+    await c.query('COMMIT');
+    const retry = await submit(L.ws, { targetStageId: L.stages[1], filter: { stageId: L.stages[0] } }, 'busy-key');
+    assert.equal(retry.status, 202, 'the same request succeeds once the lock is free — the key was not burned');
+  } finally {
+    await c.query('ROLLBACK').catch(() => {});
+    c.release();
+    await dropWorkspace(L.ws);
+  }
+});
+
 // Mechanism: state check before version check in moveOpportunity.
 test('single move: a retry after success is 200 changed=false; a stale version is a real 409', async () => {
   const { id, version } = await one('SELECT id, version FROM opportunities WHERE workspace_id = $1 AND stage_id = $2 LIMIT 1', [W.ws, W.stages[0]]);

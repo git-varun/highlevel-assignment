@@ -11,8 +11,21 @@ export const MAX_PENDING_JOBS = Number(process.env.MAX_PENDING_JOBS ?? 10);
 const FILTER_KEYS = ['stageId', 'ownerId', 'status', 'valueMin', 'valueMax', 'createdFrom', 'createdTo'];
 const STATUSES = ['open', 'won', 'lost', 'abandoned'];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Date or full ISO timestamp, as a string (new Date(12345) or "2024" must not sneak through).
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(T[\d:.]+(Z|[+-]\d{2}:\d{2})?)?$/;
+// Date-only ("2024-03-01", = 00:00 UTC) or a timestamp WITH an explicit offset. A timestamp
+// without one would be read in the server's local timezone: the same request would mean a
+// different instant — and hash — on another host.
+const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})(T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:\d{2}))?$/;
+
+/** Strict ISO parse → Date, or null. Rejects impossible dates (JS rolls 2024-02-31 into March). */
+function parseInstant(v) {
+  const m = typeof v === 'string' && ISO_DATE_RE.exec(v);
+  if (!m) return null;
+  const [, y, mo, d] = m.map(Number);
+  const cal = new Date(Date.UTC(y, mo - 1, d));
+  if (cal.getUTCFullYear() !== y || cal.getUTCMonth() !== mo - 1 || cal.getUTCDate() !== d) return null;
+  const t = new Date(v);
+  return Number.isNaN(t.getTime()) ? null : t;
+}
 
 /**
  * Validate + canonicalise the request. The canonical form is what we hash, so
@@ -52,8 +65,8 @@ export function normalizeRequest(body) {
   }
   for (const k of ['createdFrom', 'createdTo']) {
     if (filter[k] != null) {
-      const d = typeof filter[k] === 'string' && ISO_DATE_RE.test(filter[k]) ? new Date(filter[k]) : null;
-      if (!d || Number.isNaN(d.getTime())) throw badRequest(`filter.${k} must be an ISO date string`);
+      const d = parseInstant(filter[k]);
+      if (!d) throw badRequest(`filter.${k} must be an ISO date (YYYY-MM-DD) or a timestamp with Z/offset`);
       f[k] = d.toISOString();
     }
   }
@@ -103,6 +116,10 @@ export async function submitBulkMove(pool, ws, idempotencyKey, body) {
     // Serialize submits PER WORKSPACE for the rest of this transaction. Without it, two
     // concurrent submits could both count 9 pending jobs, both pass the cap, and leave 11.
     // Other workspaces use a different lock key, so they are never blocked by this.
+    // Bound the wait. Each waiter holds an API-pool connection; an unbounded wait lets a burst
+    // in ONE workspace occupy the whole pool and starve every other tenant. After 2s:
+    // 55P03 → 503 + Retry-After (a retryable "busy", never a 409).
+    await c.query(`SET LOCAL lock_timeout = '2s'`);
     await c.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`bulk-submit:${ws}`]);
 
     // Replays must win over the cap: a client retrying a request we ALREADY accepted

@@ -31,6 +31,8 @@ test('hostile or malformed input is a 4xx, never a 500', async () => {
     [{ targetStageId: A.stages[1], filter: { stageID: A.stages[0] } }, 400],            // typo must not mean "everything"
     [{ targetStageId: A.stages[1], filter: { ownerId: [ownerId(1)] } }, 400],
     [{ targetStageId: A.stages[1], filter: { createdFrom: 12345 } }, 400],
+    [{ targetStageId: A.stages[1], filter: { createdFrom: '2024-02-31' } }, 400],          // JS would roll into March
+    [{ targetStageId: A.stages[1], filter: { createdFrom: '2024-01-01T00:00' } }, 400],    // no offset = host-dependent
     [{ targetStageId: A.stages[1], filter: { valueMin: '9007199254740993' } }, 400],
     [{ targetStageId: A.stages[1], filter: { valueMin: '10', valueMax: '9' } }, 400],
     [{ targetStageId: A.stages[1], filter: { stageId: "1; DROP TABLE opportunities" } }, 400],
