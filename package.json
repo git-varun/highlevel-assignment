@@ -10,6 +10,7 @@
     "seed": "node scripts/seed.js",
     "api": "node src/api/server.js",
     "worker": "node src/worker/index.js",
+    "bench": "node scripts/bench.js",
     "test": "node --test --test-concurrency=1 --test-timeout=60000 test/*.test.js"
   },
   "dependencies": {
