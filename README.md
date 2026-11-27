@@ -138,6 +138,15 @@ Each test owns its workspace. Worker tests refuse to run against a busy queue.
 | `crash.test.js` | Real process: `SIGKILL` resumes at the cursor; killed DB connections → no crash, 0 failures; `SIGTERM` hands off cleanly |
 | `api.test.js` | Tenancy; hostile input never 500; filter matrix matches independent SQL both ways; move blocked by chunk → 503; pagination |
 
+## Live demo
+
+```bash
+bash scripts/demo.sh --prep   # once: records the mutation-proof output (a few minutes)
+bash scripts/demo.sh          # guided walkthrough, Enter to advance: idempotency, kill -9 + resume, manual edit wins, tests
+```
+
+Needs the full seed (`npm run seed`) and a free port 3000. The script starts and stops its own API and worker.
+
 ## Benchmarks
 
 ```bash
