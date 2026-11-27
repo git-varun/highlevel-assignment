@@ -3,6 +3,7 @@ import express from 'express';
 import { requireWorkspace } from './workspace.js';
 import { errorHandler } from './errors.js';
 import { opportunitiesRouter } from './routes/opportunities.js';
+import { bulkMovesRouter } from './routes/bulkMoves.js';
 
 export function createApp(pool) {
   const app = express();
@@ -16,6 +17,7 @@ export function createApp(pool) {
   // Everything below is tenant-scoped.
   app.use(requireWorkspace(pool));
   app.use('/opportunities', opportunitiesRouter(pool));
+  app.use('/bulk-moves', bulkMovesRouter(pool));
 
   app.use(errorHandler);                        // must be last
   return app;
