@@ -1,13 +1,17 @@
 // One error type for "expected" failures, one handler that turns everything into JSON.
 
 export class HttpError extends Error {
-  constructor(status, code, message, details) {
+  constructor(status, code, message, details, retryAfterSec) {
     super(message);
     this.status = status;
     this.code = code;        // stable, machine-readable (clients branch on this, not on message)
     this.details = details;
+    this.retryAfterSec = retryAfterSec;
   }
 }
+
+export const tooManyRequests = (code, msg, details, retryAfterSec) =>
+  new HttpError(429, code, msg, details, retryAfterSec);
 
 export const badRequest = (msg, details) => new HttpError(400, 'BAD_REQUEST', msg, details);
 export const notFound = (msg) => new HttpError(404, 'NOT_FOUND', msg);
@@ -28,7 +32,8 @@ const PG_MAP = {
 export function errorHandler(err, req, res, _next) {
   const mapped = err instanceof HttpError ? err : PG_MAP[err.code]?.();
   if (mapped) {
-    if (mapped.status === 503) res.set('Retry-After', '1');
+    if (mapped.retryAfterSec) res.set('Retry-After', String(mapped.retryAfterSec));
+    else if (mapped.status === 503) res.set('Retry-After', '1');
     return res.status(mapped.status).json({ error: { code: mapped.code, message: mapped.message, details: mapped.details } });
   }
   if (err.type === 'entity.parse.failed') {

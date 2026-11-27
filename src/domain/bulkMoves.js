@@ -1,9 +1,11 @@
 // Bulk move: submit (idempotent, snapshotting) and progress read.
 import { createHash } from 'node:crypto';
 import { withTransaction } from '../db.js';
-import { badRequest, notFound, unprocessable } from '../api/errors.js';
+import { badRequest, notFound, unprocessable, tooManyRequests } from '../api/errors.js';
 
 export const MAX_JOB_SIZE = Number(process.env.MAX_JOB_SIZE ?? 50_000);
+// Queue-flood guard: max unfinished (queued + running) jobs per workspace.
+export const MAX_PENDING_JOBS = Number(process.env.MAX_PENDING_JOBS ?? 10);
 
 const FILTER_KEYS = ['stageId', 'ownerId', 'status', 'valueMin', 'valueMax', 'createdFrom', 'createdTo'];
 const STATUSES = ['open', 'won', 'lost', 'abandoned'];
@@ -93,6 +95,35 @@ export async function submitBulkMove(pool, ws, idempotencyKey, body) {
   return withTransaction(pool, async (c) => {
     await c.query(`SET LOCAL statement_timeout = '30s'`);
 
+    // Serialize submits PER WORKSPACE for the rest of this transaction. Without it, two
+    // concurrent submits could both count 9 pending jobs, both pass the cap, and leave 11.
+    // Other workspaces use a different lock key, so they are never blocked by this.
+    await c.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`bulk-submit:${ws}`]);
+
+    // Replays must win over the cap: a client retrying a request we ALREADY accepted
+    // gets its job back (202), never a 429 — otherwise a retry would look like a failure.
+    const prior = await c.query(
+      'SELECT id, request_hash FROM bulk_jobs WHERE workspace_id = $1 AND idempotency_key = $2',
+      [ws, idempotencyKey],
+    );
+    if (prior.rowCount) {
+      if (prior.rows[0].request_hash !== req.requestHash) {
+        throw unprocessable('IDEMPOTENCY_KEY_REUSED', 'This Idempotency-Key was already used with a different request');
+      }
+      return { job: await readJob(c, ws, prior.rows[0].id), replayed: true };
+    }
+
+    const { rows: [{ pending }] } = await c.query(
+      `SELECT count(*)::int AS pending FROM bulk_jobs
+       WHERE workspace_id = $1 AND status IN ('queued', 'running')`, [ws]);
+    if (pending >= MAX_PENDING_JOBS) {
+      throw tooManyRequests('TOO_MANY_PENDING_JOBS',
+        `This workspace already has ${pending} bulk moves pending; wait for some to finish, then retry`,
+        { pending, max: MAX_PENDING_JOBS }, 10);
+    }
+
+    // ON CONFLICT stays as the hard guarantee even though the advisory lock makes a
+    // conflict here practically impossible: never rely on a single layer.
     const ins = await c.query(
       `INSERT INTO bulk_jobs (workspace_id, idempotency_key, request_hash, target_stage_id, filter)
        SELECT $1, $2, $3, $4, $5
