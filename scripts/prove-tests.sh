@@ -59,6 +59,25 @@ mutate "tenant scoping on single move (404 across workspaces)" src/domain/opport
   's/FROM opportunities WHERE id = \$1 AND workspace_id = \$2 FOR UPDATE/FROM opportunities WHERE id = $1 AND $2::uuid IS NOT NULL FOR UPDATE/' \
   test/api.test.js 'tenancy'
 
+mutate "round-robin claim across tenants (fairness)" src/worker/jobs.js \
+  's/ORDER BY (SELECT max(r.claimed_at) FROM bulk_jobs r WHERE r.workspace_id = j.workspace_id) NULLS FIRST,/ORDER BY/' \
+  test/worker.test.js 'fairness'
+
+mutate "lock_timeout on the submit lock (no pool starvation)" src/domain/bulkMoves.js \
+  "/SET LOCAL lock_timeout = '2s'/d" test/idempotency.test.js 'fails fast'
+
+mutate "lock_timeout on single move (503, not a hung request)" src/domain/opportunities.js \
+  "/SET LOCAL lock_timeout = '2s'/d" test/api.test.js '503 BUSY'
+
+mutate "strict date parsing (no 2024-02-31, no local time)" src/domain/bulkMoves.js \
+  's/const d = parseInstant(filter\[k\]);/const d = new Date(filter[k]);/' test/api.test.js 'hostile'
+
+mutate "retry budget reported as failures, not claims" src/domain/bulkMoves.js \
+  's/failures: j.failures,/failures: j.attempt,/' test/worker.test.js 'health'
+
+mutate "checked-out client error handler (DB kill must not crash)" src/db.js \
+  "s/client.on('error', onError);/void onError;/" test/crash.test.js 'killed mid-job'
+
 echo "\n$caught caught, $missed missed"
 
 # Mutated code can write data the real code never would (e.g. a cross-tenant row).

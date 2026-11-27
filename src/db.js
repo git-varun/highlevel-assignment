@@ -33,6 +33,13 @@ export function createPool(role) {
  */
 export async function withTransaction(pool, fn) {
   const client = await pool.connect();
+  // If the server kills this connection while we hold it (DB restart, failover,
+  // pg_terminate_backend, idle_in_transaction timeout), pg emits an 'error' EVENT on the
+  // client. pool.on('error') only covers IDLE clients; an unhandled 'error' event crashes
+  // the whole Node process. Capture it here — the in-flight query rejects on its own.
+  let broken = null;
+  const onError = (err) => { broken = err; };
+  client.on('error', onError);
   try {
     await client.query('BEGIN');
     const result = await fn(client);
@@ -42,6 +49,9 @@ export async function withTransaction(pool, fn) {
     await client.query('ROLLBACK').catch(() => {}); // connection may already be dead
     throw err;
   } finally {
-    client.release();                                 // ALWAYS — or the pool leaks
+    client.off('error', onError);
+    // ALWAYS release — or the pool leaks. Passing the error DESTROYS a broken connection
+    // instead of handing it to the next caller.
+    client.release(broken ?? undefined);
   }
 }

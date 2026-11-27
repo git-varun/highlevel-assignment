@@ -25,6 +25,15 @@ const spawnWorker = () => {
   return p;
 };
 
+// once(p, 'exit') registered AFTER the process already exited waits forever — check first.
+const exited = (p) => p.exitCode !== null || p.signalCode !== null;
+async function stopProc(p) {
+  if (exited(p)) return;
+  const done = once(p, 'exit');
+  p.kill('SIGTERM');
+  await done;
+}
+
 async function bigJob() {
   const W = await makeWorkspace({ deals: 12_000 });
   made.push(W.ws);
@@ -44,13 +53,40 @@ test('SIGKILL mid-job: a new worker resumes from the committed cursor, nothing a
 
   await waitFor(async () => (await jobStatus(id)).lease_until < new Date(), { what: 'lease expiry' }); // …until its lease expires
   const w2 = spawnWorker();
-  try { await waitDone(id); } finally { w2.kill('SIGTERM'); await once(w2, 'exit'); }
+  try { await waitDone(id); } finally { await stopProc(w2); }
 
   const job = await jobStatus(id);
   assert.equal(job.status, 'completed');
   assert.equal(job.attempt, 2);
   assert.equal(job.failures, 1, 'a crash costs one unit of retry budget');
   assert.match(w2.log, new RegExp(`resume_from=${atKill.cursor_id}\\b`), 'resumed exactly at the committed cursor');
+  const v = await verifyJob(pool, id);
+  assert.ok(v.ok, JSON.stringify(v.checks));
+});
+
+// Mechanism: transient-error classification + in-process chunk retry with backoff.
+test('database connections killed mid-job: chunk retries absorb it, job completes correctly', async () => {
+  const id = await bigJob();
+  const w = spawnWorker();
+  try {
+    await waitFor(async () => (await jobStatus(id)).applied_count >= 400, { what: '400 applied' });
+    // Server-side kill of every worker connection, repeatedly for ~1s — what a DB restart,
+    // failover or network blip looks like to the worker. Some kills land mid-chunk.
+    let killed = 0;
+    for (let i = 0; i < 20; i++) {
+      const { rows } = await pool.query(
+        `SELECT pg_terminate_backend(pid) AS ok FROM pg_stat_activity WHERE application_name = 'worker'`);
+      killed += rows.filter((r) => r.ok).length;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(killed > 0, 'connections were actually terminated');
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(exited(w), false, `worker process must survive killed DB connections\n${w.log.slice(-800)}`);
+    await waitDone(id);
+  } finally { await stopProc(w); }
+  const job = await jobStatus(id);
+  assert.equal(job.status, 'completed');
+  assert.equal(job.failures, 0, 'transient errors were retried in-process, not charged to the job');
   const v = await verifyJob(pool, id);
   assert.ok(v.ok, JSON.stringify(v.checks));
 });
@@ -68,6 +104,6 @@ test('SIGTERM mid-job: graceful hand-off keeps progress and costs no retry budge
   assert.ok(handedBack.applied_count >= 500, 'committed progress kept');
 
   const w2 = spawnWorker();
-  try { await waitDone(id); } finally { w2.kill('SIGTERM'); await once(w2, 'exit'); }
+  try { await waitDone(id); } finally { await stopProc(w2); }
   assert.ok((await verifyJob(pool, id)).ok);
 });

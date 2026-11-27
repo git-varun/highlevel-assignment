@@ -81,6 +81,29 @@ test('filter matrix: snapshot matches an independent SQL count for each combinat
   }
 });
 
+// Mechanism: lock_timeout on the single move. A bulk chunk holds deal row locks; a manual
+// move on one of those deals must fail fast with a retryable 503, never hang or 409.
+test('manual move on a deal locked by a running chunk → 503 BUSY after ~2s, then succeeds', async () => {
+  const { id } = await one('SELECT id FROM opportunities WHERE workspace_id = $1 AND stage_id = $2 LIMIT 1', [A.ws, A.stages[0]]);
+  const chunk = await pool.connect();                       // stands in for a chunk transaction
+  try {
+    await chunk.query('BEGIN');
+    await chunk.query('SELECT id FROM opportunities WHERE id = $1 FOR UPDATE', [id]);
+    const t0 = Date.now();
+    const busy = await api().post(`/opportunities/${id}/move`).set('X-Workspace-Id', A.ws).send({ toStageId: A.stages[2] });
+    assert.equal(busy.status, 503);
+    assert.equal(busy.body.error.code, 'BUSY');
+    assert.equal(busy.headers['retry-after'], '1');
+    assert.ok(Date.now() - t0 >= 1900, 'waited for the lock_timeout, not instantly');
+    await chunk.query('COMMIT');
+    const ok = await api().post(`/opportunities/${id}/move`).set('X-Workspace-Id', A.ws).send({ toStageId: A.stages[2] });
+    assert.equal(ok.status, 200);
+  } finally {
+    await chunk.query('ROLLBACK').catch(() => {});
+    chunk.release();
+  }
+});
+
 test('list by stage: keyset pagination walks every deal exactly once', async () => {
   const stage = A.stages[1];
   const seen = [];
