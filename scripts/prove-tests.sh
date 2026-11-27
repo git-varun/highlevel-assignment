@@ -32,7 +32,7 @@ mutate "request-hash check (same key, different body)" src/domain/bulkMoves.js \
   's/prior.rows\[0\].request_hash !== req.requestHash/false/' test/idempotency.test.js 'different body'
 
 mutate "per-workspace submit lock (cap under concurrency)" src/domain/bulkMoves.js \
-  '/pg_advisory_xact_lock/d' test/idempotency.test.js 'pending cap'
+  '/pg_advisory_xact_lock/d' test/idempotency.test.js 'serialised'
 
 mutate "state-before-version (single move retry is not 409)" src/domain/opportunities.js \
   '/if (opp.stage_id === toStageId) return/d' test/idempotency.test.js 'single move'

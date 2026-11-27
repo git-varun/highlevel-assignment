@@ -98,6 +98,33 @@ test('pending cap: a concurrent burst of 12 → exactly 10 accepted, 2 × 429; r
   } finally { await dropWorkspace(C.ws); }
 });
 
+// Mechanism: the per-workspace advisory lock, tested DETERMINISTICALLY. The burst test
+// above catches a missing lock only when the race happens to interleave; this one doesn't
+// depend on timing: we hold the workspace's submit lock ourselves and prove a submit waits.
+test('submits in one workspace are serialised; other workspaces are not blocked', async () => {
+  const L = await makeWorkspace({ deals: 20 });
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    await c.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [`bulk-submit:${L.ws}`]);
+    let settled = false;
+    const blocked = submit(L.ws, { targetStageId: L.stages[1], filter: { stageId: L.stages[0] } })
+      .then((r) => { settled = true; return r; });
+    const free = await submit(W2.ws, { targetStageId: W2.stages[2], filter: { stageId: W2.stages[3] } });
+    assert.equal(free.status, 202, 'another workspace is not blocked by this lock');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(settled, false, 'submit must wait while another submit holds the workspace lock');
+    await c.query('COMMIT');
+    assert.equal((await blocked).status, 202, 'and proceeds once the lock is released');
+  } finally {
+    // If an assertion failed before COMMIT, this client still holds an open transaction
+    // (and the lock). Releasing it as-is would poison the pool for every later query.
+    await c.query('ROLLBACK').catch(() => {});
+    c.release();
+    await dropWorkspace(L.ws);
+  }
+});
+
 // Mechanism: state check before version check in moveOpportunity.
 test('single move: a retry after success is 200 changed=false; a stale version is a real 409', async () => {
   const { id, version } = await one('SELECT id, version FROM opportunities WHERE workspace_id = $1 AND stage_id = $2 LIMIT 1', [W.ws, W.stages[0]]);

@@ -16,6 +16,10 @@ export const ownerId = (n) => `bbbbbbbb-0000-0000-0000-${String(n).padStart(12, 
 let migrated = false;
 export async function ready() {
   if (!migrated) { await migrate(pool); migrated = true; }
+  // Safety net: a test process that crashed mid-run can't run its after() hooks.
+  // Test files run one at a time, so any 'test …' workspace left now is garbage.
+  const { rows } = await pool.query(`SELECT id FROM workspaces WHERE name LIKE 'test %'`);
+  for (const { id } of rows) await dropWorkspace(id);
 }
 
 /**
