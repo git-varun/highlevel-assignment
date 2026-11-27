@@ -30,7 +30,7 @@ export async function withRetry(fn, { retries = 5, baseMs = 200, capMs = 10_000,
       if (!isTransient(err) || attempt >= retries) throw err;
       const exp = Math.min(capMs, baseMs * 2 ** attempt);
       const wait = exp / 2 + Math.random() * (exp / 2);
-      onRetry?.(err, attempt + 1, wait);
+      await onRetry?.(err, attempt + 1, wait); // awaited: it may renew the lease
       await sleep(wait);
     }
   }

@@ -52,7 +52,11 @@ export async function claimJob(pool, workerId) {
                   AND NOT EXISTS (SELECT 1 FROM bulk_jobs r
                                   WHERE r.workspace_id = j.workspace_id AND r.status = 'running'))
               OR (j.status = 'running' AND j.lease_until < now() AND j.failures + 1 < j.max_attempts) )
-         ORDER BY j.created_at
+         -- Round-robin across tenants: the workspace whose last claim is OLDEST goes first
+         -- (never-served first). Job age only breaks ties. Without this, a tenant who queued
+         -- 10 jobs first would have all 10 run before a later tenant got a single turn.
+         ORDER BY (SELECT max(r.claimed_at) FROM bulk_jobs r WHERE r.workspace_id = j.workspace_id) NULLS FIRST,
+                  j.created_at
          LIMIT 1
          FOR UPDATE SKIP LOCKED
        )
@@ -63,6 +67,7 @@ export async function claimJob(pool, workerId) {
            attempt      = j.attempt + 1,
            lease_until  = now() + make_interval(secs => $2),
            heartbeat_at = now(),
+           claimed_at   = now(),
            started_at   = COALESCE(j.started_at, now())
        FROM candidate c
        WHERE j.id = c.id

@@ -34,7 +34,14 @@ export function startWorker(pool, { id = `${os.hostname()}:${process.pid}`, log 
           return;
         }
         const r = await withRetry(() => runChunk(pool, job, cfg.chunkSize), {
-          onRetry: (e, n, ms) => log(`[worker ${id}] chunk retry #${n} in ${ms | 0}ms: ${e.code ?? e.message}`),
+          onRetry: async (e, n, ms) => {
+            log(`[worker ${id}] chunk retry #${n} in ${ms | 0}ms: ${e.code ?? e.message}`);
+            // Retries + backoff can outlast the lease. Renew it so a worker that is alive and
+            // retrying isn't mistaken for dead (reclaimed + charged a failure). Best effort:
+            // if the DB is still down this fails too; if we lost ownership, the next
+            // runChunk throws LostOwnershipError and we stop.
+            await heartbeat(pool, job).catch(() => {});
+          },
         });
         lastRenew = Date.now(); // the chunk commit renewed the lease
         if (r.done) {

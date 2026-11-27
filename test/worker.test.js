@@ -1,7 +1,7 @@
 // Worker correctness: concurrency, fencing, scheduling, recovery. States are set up
 // explicitly (no reliance on timing luck), and scheduling tests run with ONE slot —
 // two racing slots once hid a livelock.
-import { test, before, after } from 'node:test';
+import { test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { ready, pool, api, makeWorkspace, dropWorkspace, submit, one, worker, jobStatus, waitDone, waitFor } from './helpers.js';
 import { claimJob, runChunk, completeJob, releaseJob, reapExhausted, LostOwnershipError } from '../src/worker/jobs.js';
@@ -14,6 +14,12 @@ before(async () => {
   // These tests run real workers that claim ANY job: refuse to run next to foreign work.
   const { n } = await one(`SELECT count(*)::int n FROM bulk_jobs WHERE status IN ('queued','running')`);
   assert.equal(n, 0, 'database has pending bulk jobs from elsewhere; worker tests need an idle queue');
+});
+// A test that leaves a job queued hands the NEXT test claimable work it didn't create
+// (that made the fairness test flaky). Close out every unfinished job after each test.
+afterEach(async () => {
+  await pool.query(`UPDATE bulk_jobs SET status = 'failed', error = 'test teardown', lease_until = NULL
+                    WHERE workspace_id = ANY($1::uuid[]) AND status IN ('queued', 'running')`, [made]);
 });
 after(async () => { for (const w of made) await dropWorkspace(w); await pool.end(); });
 
@@ -115,6 +121,26 @@ test('a crashed job does not livelock the queue (single slot)', async () => {
     for (const id of [j1, j2, k]) await waitDone(id, 10_000);
   } finally { await w.stop(); }
   for (const id of [j1, j2, k]) assert.ok((await verifyJob(pool, id)).ok, `job ${id} verified`);
+});
+
+// Mechanism: round-robin claim across tenants (least-recently-served workspace first).
+test('fairness: after serving workspace A once, workspace B goes before A\'s next (older) job', async () => {
+  const A = await ws({ deals: 80 });
+  const B = await ws({ deals: 40 });
+  const a1 = await submitMove(A, 0, 1);
+  const a2 = await submitMove(A, 2, 3);
+  const b1 = await submitMove(B, 0, 1);               // submitted LAST
+  const done = (id) => pool.query(`UPDATE bulk_jobs SET status = 'completed' WHERE id = $1`, [id]);
+
+  const first = await claimJob(pool, 'w');
+  assert.equal(first.id, a1, 'nobody served yet → oldest job');
+  await done(a1);
+  const second = await claimJob(pool, 'w');
+  assert.equal(second.id, b1, 'B has never been served → B goes before A\'s older second job');
+  await done(b1);
+  const third = await claimJob(pool, 'w');
+  assert.equal(third.id, a2);
+  await done(a2);
 });
 
 // Mechanism: no ordering within a workspace — backoff must not block independent jobs.
