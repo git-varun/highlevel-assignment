@@ -41,6 +41,31 @@ Postgres is the data store **and** the queue. Job state, cursor and deal updates
 | Commit per chunk | One transaction | One transaction holds 50k locks, blocks users and vacuum, loses all work on a crash |
 | Cursor in the DB | In memory | Memory dies with the process |
 
+## 1b. Observable progress
+
+**Asked:** progress from real committed state; tell slow, stuck and failed apart.
+
+**Designed:**
+- **Committed state only.** Every number in `GET /bulk-moves/:id` is a column updated in the same transaction as the work it counts, so it is exact after any restart.
+- **Health** is derived in SQL from those columns, using the DB clock:
+
+| Health | Signal |
+|---|---|
+| `running` | Chunks committing |
+| **`slow`** | Lease renewed, but no chunk committed for 15 s |
+| **`stalled`** (stuck) | Lease expired: the owner is dead; the job is reclaimed and resumes |
+| `retrying` | Last attempt failed; backing off until `nextRetryAt` |
+| **`failed`** | Retry budget exhausted, or the completion check failed |
+| `completed` | Verified: no item pending and applied + skipped = total |
+
+- **Never 100% early:** `percent` is floored, and `completed` is written only by a statement that verifies the invariant.
+- **The retry budget** (`failures`) is reported separately from `claims`, so deploys don't look like failures.
+
+| Chose | Over | Because |
+|---|---|---|
+| Committed columns | In-memory counter or progress cache | Both drift from the truth after a crash |
+| DB clock | App-server clock | Clock skew between machines would mislabel healthy jobs |
+
 ## 2. Idempotency
 
 **Asked:** the key, where it lives, what it protects, where a retry still slips through.
