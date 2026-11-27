@@ -2,39 +2,93 @@
 // Every write after claim is fenced on (id, attempt): a worker that lost ownership
 // can never change a job it no longer owns.
 import { withTransaction } from '../db.js';
+import { buildSnapshot, MAX_JOB_SIZE } from '../domain/bulkMoves.js';
 
 export const LEASE_SECONDS = Number(process.env.LEASE_SECONDS ?? 30);
 
 export class LostOwnershipError extends Error {
   constructor(jobId) { super(`lost ownership of job ${jobId}`); this.name = 'LostOwnershipError'; }
 }
+class TooManyMatchesError extends Error {}
+
+const txGuards = async (c, statementTimeout) => {
+  await c.query(`SET LOCAL lock_timeout = '2s'`);
+  await c.query(`SET LOCAL statement_timeout = '${statementTimeout}'`);
+  // A worker frozen MID-transaction (GC pause, SIGSTOP, VM stall) would hold the job-row
+  // lock forever, and SKIP LOCKED claimers would skip it forever. Postgres kills a session
+  // that sits idle inside an open transaction longer than this → rollback → locks freed.
+  // Must be shorter than the lease so the job is reclaimable once the lease expires.
+  await c.query(`SET LOCAL idle_in_transaction_session_timeout = '${Math.max(1, Math.floor(LEASE_SECONDS / 2))}s'`);
+};
 
 /**
- * Claim one job. Candidates:
- *   - queued, past its backoff time, or
- *   - running with an expired lease (owner crashed) → counts as a failure.
- * FOR UPDATE SKIP LOCKED: concurrent workers skip rows another worker is claiming
- * instead of waiting, so two workers never claim the same job.
- * NOT EXISTS: skip workspaces that already have a live running job (isolation). The
- * partial unique index is the hard guarantee if two claims race past this check.
+ * Freeze the job's item list at START time (not submit time), so a queued job sees the
+ * results of the jobs that ran before it. Fenced and all-or-nothing: a crash mid-snapshot
+ * rolls back and the next owner snapshots again. Already snapshotted (resume) → no-op.
+ * Returns { total } or { failed: true } when the set grew past the cap since submit.
+ */
+export async function snapshotJob(pool, job) {
+  try {
+    return await withTransaction(pool, async (c) => {
+      await txGuards(c, '60s');
+      const fence = await c.query(
+        `SELECT snapshot_at, total_count FROM bulk_jobs
+         WHERE id = $1 AND attempt = $2 AND status = 'running' FOR UPDATE`,
+        [job.id, job.attempt],
+      );
+      if (!fence.rowCount) throw new LostOwnershipError(job.id);
+      if (fence.rows[0].snapshot_at) return { total: fence.rows[0].total_count };
+
+      const r = await buildSnapshot(c, job);
+      if (r.tooMany) throw new TooManyMatchesError(); // roll back the 50,001 inserted items
+      await c.query(
+        `UPDATE bulk_jobs SET heartbeat_at = now(), lease_until = now() + make_interval(secs => $2)
+         WHERE id = $1`, [job.id, LEASE_SECONDS]);
+      return r;
+    });
+  } catch (err) {
+    if (!(err instanceof TooManyMatchesError)) throw err;
+    await failJob(pool, job, `TOO_MANY_MATCHES: when the job started, the filter matched more than ${MAX_JOB_SIZE} opportunities (earlier jobs grew the set); narrow it and resubmit`);
+    return { failed: true };
+  }
+}
+
+/**
+ * Claim one job — strict FIFO per workspace.
+ *
+ * heads: for every workspace, its OLDEST unfinished (queued|running) job. Only a head may
+ * be claimed. So a later job can never overtake an earlier one — not even while the earlier
+ * one is backing off after an error. (Cost: a failing head blocks only its OWN workspace,
+ * bounded by max_attempts. Other workspaces have their own heads.)
+ *
+ * A head is claimable when:
+ *   - queued and past its backoff time, or
+ *   - running with an expired lease (owner crashed) → costs one failure.
+ * A head that is running with a live lease is not claimable → the whole workspace waits:
+ * this IS the one-running-job-per-workspace rule. The partial unique index backs it up.
+ *
+ * Across workspaces: oldest head first. FOR UPDATE SKIP LOCKED: concurrent workers skip a
+ * head another worker is claiming and take the next workspace's head instead of waiting.
  */
 export async function claimJob(pool, workerId) {
   try {
     const { rows } = await pool.query(
-      `WITH candidate AS (
+      `WITH heads AS (
+         SELECT DISTINCT ON (workspace_id) id, created_at
+         FROM bulk_jobs
+         WHERE status IN ('queued', 'running')
+         ORDER BY workspace_id, created_at, id
+       ),
+       candidate AS (
          SELECT j.id
-         FROM bulk_jobs j
+         FROM bulk_jobs j JOIN heads h ON h.id = j.id
          -- Reclaiming a crashed job costs one failure, so it needs failures + 1 < max.
          -- The reaper takes exactly the complement (failures + 1 >= max): no overlap, no race.
          WHERE ( (j.status = 'queued'  AND j.next_run_at <= now() AND j.failures < j.max_attempts)
               OR (j.status = 'running' AND j.lease_until < now() AND j.failures + 1 < j.max_attempts) )
-           AND NOT EXISTS (
-             SELECT 1 FROM bulk_jobs r
-             WHERE r.workspace_id = j.workspace_id AND r.status = 'running'
-               AND r.id <> j.id AND r.lease_until >= now())
-         ORDER BY j.created_at
+         ORDER BY h.created_at
          LIMIT 1
-         FOR UPDATE SKIP LOCKED
+         FOR UPDATE OF j SKIP LOCKED
        )
        UPDATE bulk_jobs j
        SET failures     = j.failures + CASE WHEN j.status = 'running' THEN 1 ELSE 0 END,
@@ -46,7 +100,8 @@ export async function claimJob(pool, workerId) {
            started_at   = COALESCE(j.started_at, now())
        FROM candidate c
        WHERE j.id = c.id
-       RETURNING j.id, j.workspace_id, j.target_stage_id, j.attempt, j.failures, j.cursor_id, j.total_count`,
+       RETURNING j.id, j.workspace_id, j.target_stage_id, j.attempt, j.failures, j.cursor_id,
+                 j.total_count, j.snapshot_at`,
       [workerId, LEASE_SECONDS],
     );
     return rows[0] ?? null;
@@ -71,13 +126,7 @@ export async function claimJob(pool, workerId) {
  */
 export async function runChunk(pool, job, chunkSize) {
   return withTransaction(pool, async (c) => {
-    await c.query(`SET LOCAL lock_timeout = '2s'`);
-    await c.query(`SET LOCAL statement_timeout = '10s'`);
-    // A worker frozen MID-transaction (GC pause, SIGSTOP, VM stall) would hold the job-row
-    // lock forever, and SKIP LOCKED claimers would skip it forever. Postgres kills a session
-    // that sits idle inside an open transaction longer than this → rollback → locks freed.
-    // Must be shorter than the lease so the job is reclaimable once the lease expires.
-    await c.query(`SET LOCAL idle_in_transaction_session_timeout = '${Math.max(1, Math.floor(LEASE_SECONDS / 2))}s'`);
+    await txGuards(c, '10s');
 
     // a) fence
     const fence = await c.query(

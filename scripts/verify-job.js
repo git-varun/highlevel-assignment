@@ -12,12 +12,13 @@ export async function verifyJob(pool, jobId) {
     FROM bulk_job_items WHERE job_id = $1`);
   const tr = await q(`SELECT count(*)::int n, count(DISTINCT opportunity_id)::int distinct_opps
     FROM stage_transitions WHERE job_id = $1`);
-  // Applied deals must sit in the target stage, unless a user moved them AFTER the job did.
+  // Applied deals must sit in the target stage, unless something moved them AFTER this job
+  // did — a user, or a later bulk job (jobs chain: B may legitimately move A's results).
   const misplaced = await q(`SELECT count(*)::int n FROM bulk_job_items i
     JOIN bulk_jobs j ON j.id = i.job_id JOIN opportunities o ON o.id = i.opportunity_id
     WHERE i.job_id = $1 AND i.status = 'applied' AND o.stage_id <> j.target_stage_id
       AND NOT EXISTS (SELECT 1 FROM stage_transitions t WHERE t.opportunity_id = o.id
-                      AND t.source = 'manual' AND t.id > (SELECT max(id) FROM stage_transitions
+                      AND t.id > (SELECT max(id) FROM stage_transitions
                       WHERE job_id = $1 AND opportunity_id = o.id))`);
   // Skipped deals must really have been modified (version moved past the snapshot).
   const wrongSkips = await q(`SELECT count(*)::int n FROM bulk_job_items i
@@ -31,7 +32,7 @@ export async function verifyJob(pool, jobId) {
     'job counters match item rows': job.applied_count === items.applied && job.skipped_count === items.skipped,
     'one transition per applied item': tr.n === items.applied,
     'no duplicate transitions': tr.n === tr.distinct_opps,
-    'applied deals are in target stage (or later moved by a user)': misplaced.n === 0,
+    'applied deals are in target stage (or moved again later)': misplaced.n === 0,
     'every skip was a real concurrent modification': wrongSkips.n === 0,
   };
   return { job: { status: job.status, total: job.total_count, applied: job.applied_count,
