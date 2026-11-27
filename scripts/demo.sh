@@ -74,8 +74,7 @@ pause
 
 # ── 1. idempotency ──────────────────────────────────────────────────────────
 step "1 · Idempotency — a retry gets the same job, never a 409"
-S2=$(sql "SELECT id FROM stages WHERE workspace_id = \$1 ORDER BY position" "$SMALL2" | head -2 | paste -sd' ')
-FROM2=${S2% *}; TO2=${S2#* }
+read -r FROM2 TO2 <<< "$(sql "SELECT id FROM stages WHERE workspace_id = \$1 ORDER BY position LIMIT 2" "$SMALL2" | tr '\n' ' ')"
 KEY="demo-$(date +%s)"
 BODY="{\"targetStageId\":$TO2,\"filter\":{\"stageId\":$FROM2}}"
 show "POST /bulk-moves   Idempotency-Key: $KEY"
@@ -135,7 +134,7 @@ pause
 step "3 · A user edits a deal after the job was submitted — the user wins"
 # fullest stage as the source; two other stages as the job's target and the user's choice
 FROM3=$(sql "SELECT stage_id FROM opportunities WHERE workspace_id = \$1 GROUP BY 1 ORDER BY count(*) DESC LIMIT 1" "$SMALL3")
-read -r TO3 LOST3 <<< "$(sql "SELECT id FROM stages WHERE workspace_id = \$1 AND id <> \$2 ORDER BY position LIMIT 2" "$SMALL3" "$FROM3" | paste -sd' ')"
+read -r TO3 LOST3 <<< "$(sql "SELECT id FROM stages WHERE workspace_id = \$1 AND id <> \$2 ORDER BY position LIMIT 2" "$SMALL3" "$FROM3" | tr '\n' ' ')"
 show "POST /bulk-moves   (worker is stopped, so the job waits)"
 submit "$SMALL3" "manual-$(date +%s)" "{\"targetStageId\":$TO3,\"filter\":{\"stageId\":$FROM3}}"
 [ -n "$JOB" ] || { echo "submit failed — stopping"; exit 1; }

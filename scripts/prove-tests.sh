@@ -10,11 +10,12 @@ if ! git diff --quiet -- src; then echo "src/ has uncommitted changes; commit or
 # Without this baseline, a broken suite would report every mutation as "caught".
 echo "baseline: full suite on unmodified code…"
 if ! npm test >/dev/null 2>&1; then echo "baseline FAILED — fix the suite first; mutation results would be meaningless"; exit 2; fi
-echo "baseline green\n"
+printf "baseline green\n\n"
 
 caught=0; missed=0
 mutate() { # $1 label, $2 file, $3 sed expression, $4 test file, $5 test name pattern
-  sed -i "$3" "$2"
+  # -i.bak is the one in-place form both GNU (Linux) and BSD (macOS) sed accept
+  sed -i.bak "$3" "$2" && rm -f "$2.bak"
   if git diff --quiet -- "$2"; then echo "?? $1: mutation did not apply"; missed=$((missed+1)); return; fi
   if node --test --test-timeout=30000 --test-name-pattern="$5" "$4" >/dev/null 2>&1; then
     echo "✘ MISSED  $1  (test still passed with the mechanism removed)"; missed=$((missed+1))
@@ -78,7 +79,7 @@ mutate "retry budget reported as failures, not claims" src/domain/bulkMoves.js \
 mutate "checked-out client error handler (DB kill must not crash)" src/db.js \
   "s/client.on('error', onError);/void onError;/" test/crash.test.js 'killed mid-job'
 
-echo "\n$caught caught, $missed missed"
+printf "\n%s caught, %s missed\n" "$caught" "$missed"
 
 # Mutated code can write data the real code never would (e.g. a cross-tenant row).
 # Prove the suite is still green afterwards, i.e. nothing leaked into later runs.
