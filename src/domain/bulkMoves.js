@@ -212,15 +212,41 @@ export async function submitBulkMove(pool, ws, idempotencyKey, body) {
  * so it stays truthful across restarts. Time comparisons use the DB clock (now()),
  * never the API server's clock, so clock skew between machines can't mislabel a job.
  */
+// A running job with a live lease but no committed chunk for this long is reported 'slow'.
+const SLOW_AFTER_SECONDS = Number(process.env.SLOW_AFTER_SECONDS ?? 15);
+
+/**
+ * health answers the user's real question, "what is my job doing?":
+ *   queued                 waiting for a free worker
+ *   waiting_for_workspace  another job of this workspace is running (one at a time)
+ *   retrying               a previous attempt failed; backing off until nextRetryAt
+ *   running                committing chunks normally
+ *   slow                   owner alive (lease renewed) but no chunk committed for a while
+ *   stalled                owner stopped renewing its lease → presumed crashed; will be reclaimed
+ *   completed / failed     terminal
+ * All derived from committed columns, with the DB clock.
+ */
 async function readJob(q, ws, id) {
   const { rows } = await q.query(
-    `SELECT id, status, target_stage_id, filter, total_count, applied_count, skipped_count,
-            attempt, max_attempts, error, created_at, started_at, finished_at,
-            heartbeat_at, last_progress_at, lease_until,
-            (status = 'running' AND lease_until < now()) AS lease_expired,
-            extract(epoch FROM now() - heartbeat_at)::int AS seconds_since_heartbeat
-     FROM bulk_jobs WHERE id = $1 AND workspace_id = $2`,
-    [id, ws],
+    `SELECT j.id, j.status, j.target_stage_id, j.filter, j.total_count, j.applied_count, j.skipped_count,
+            j.attempt, j.failures, j.max_attempts, j.error, j.created_at, j.started_at, j.finished_at,
+            j.heartbeat_at, j.last_progress_at,
+            CASE WHEN j.status = 'queued' AND j.next_run_at > now() THEN j.next_run_at END AS next_retry_at,
+            CASE
+              WHEN j.status IN ('completed', 'failed') THEN j.status
+              WHEN j.status = 'running' AND j.lease_until < now() THEN 'stalled'
+              WHEN j.status = 'running'
+                AND COALESCE(j.last_progress_at, j.claimed_at) < now() - make_interval(secs => $3) THEN 'slow'
+              WHEN j.status = 'running' THEN 'running'
+              WHEN j.failures > 0 AND j.next_run_at > now() THEN 'retrying'
+              WHEN EXISTS (SELECT 1 FROM bulk_jobs r WHERE r.workspace_id = j.workspace_id
+                           AND r.status = 'running' AND r.id <> j.id) THEN 'waiting_for_workspace'
+              ELSE 'queued'
+            END AS health,
+            extract(epoch FROM now() - j.heartbeat_at)::int AS seconds_since_heartbeat,
+            extract(epoch FROM now() - j.last_progress_at)::int AS seconds_since_progress
+     FROM bulk_jobs j WHERE j.id = $1 AND j.workspace_id = $2`,
+    [id, ws, SLOW_AFTER_SECONDS],
   );
   const j = rows[0];
   if (!j) return null;
@@ -228,8 +254,7 @@ async function readJob(q, ws, id) {
   return {
     id: j.id,
     status: j.status,
-    // 'stalled' = the owner stopped heartbeating; the job will be reclaimed. Not the same as failed.
-    health: j.status === 'running' && j.lease_expired ? 'stalled' : j.status,
+    health: j.health,
     targetStageId: j.target_stage_id,
     filter: j.filter,
     progress: {
@@ -240,15 +265,23 @@ async function readJob(q, ws, id) {
       // floor, never round: 99.996% must not display as 100% while work remains
       percent: j.total_count === 0 ? 100 : Math.floor((done / j.total_count) * 10_000) / 100,
     },
-    attempt: j.attempt,
-    maxAttempts: j.max_attempts,
-    error: j.error,
+    // Retry budget = failures (crashes + errors), NOT claims: a graceful hand-off during a
+    // deploy is a claim but not a failure. Showing claims next to maxFailures would make a
+    // healthy job look over budget after a few deploys.
+    retry: {
+      failures: j.failures,
+      maxFailures: j.max_attempts,
+      nextRetryAt: j.next_retry_at,
+      lastError: j.error,
+    },
+    claims: j.attempt,
     createdAt: j.created_at,
     startedAt: j.started_at,
     finishedAt: j.finished_at,
     lastHeartbeatAt: j.heartbeat_at,
     lastProgressAt: j.last_progress_at,
     secondsSinceHeartbeat: j.seconds_since_heartbeat,
+    secondsSinceProgress: j.seconds_since_progress,
   };
 }
 

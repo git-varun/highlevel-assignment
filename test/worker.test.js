@@ -198,6 +198,35 @@ test('a job whose counters do not add up is failed, never reported completed', a
   assert.match(row.error, /completion check failed/);
 });
 
+// Mechanism: health derived from committed columns tells the user what the job is doing.
+test('health: queued, waiting_for_workspace, retrying, running, slow, stalled are distinguishable', async () => {
+  const W = await ws({ deals: 80 });
+  const a = await submitMove(W, 0, 1);
+  const b = await submitMove(W, 2, 3);
+  const health = async (id) => (await api().get(`/bulk-moves/${id}`).set('X-Workspace-Id', W.ws)).body;
+  const set = (id, sql) => pool.query(`UPDATE bulk_jobs SET ${sql} WHERE id = $1`, [id]);
+
+  assert.equal((await health(a)).health, 'queued', 'waiting for a free worker');
+  await set(a, `status = 'running', attempt = 1, lease_until = now() + interval '30 s',
+                claimed_at = now(), last_progress_at = now()`);
+  assert.equal((await health(a)).health, 'running');
+  assert.equal((await health(b)).health, 'waiting_for_workspace', 'one running job per workspace');
+  await set(a, `last_progress_at = now() - interval '60 s'`);
+  assert.equal((await health(a)).health, 'slow', 'alive (lease fresh) but no progress');
+  await set(a, `lease_until = now() - interval '1 s'`);
+  assert.equal((await health(a)).health, 'stalled', 'lease expired: presumed crashed');
+
+  await set(a, `status = 'failed'`);
+  await set(b, `failures = 2, attempt = 7, next_run_at = now() + interval '30 s', error = 'deadlock detected'`);
+  const r = await health(b);
+  assert.equal(r.health, 'retrying');
+  assert.equal(r.retry.failures, 2);
+  assert.equal(r.retry.maxFailures, 5);
+  assert.equal(r.claims, 7, 'claims (incl. graceful hand-offs) are reported separately from the retry budget');
+  assert.ok(r.retry.nextRetryAt, 'tells the user when the next attempt is');
+  assert.equal(r.retry.lastError, 'deadlock detected');
+});
+
 // Mechanism: progress from committed state; floor; DB-clock lease expiry.
 test('progress: never 100% while work remains; stalled when the lease expired', async () => {
   const W = await ws({ deals: 20 });
