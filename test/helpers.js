@@ -51,7 +51,10 @@ export async function makeWorkspace({ deals = 300, stages = 4 } = {}) {
 
 /** Remove everything a test workspace created, children first (FK order). */
 export async function dropWorkspace(ws) {
-  await pool.query(`DELETE FROM stage_transitions WHERE workspace_id = $1`, [ws]);
+  // By the deal's workspace too: if a bug (or a mutation test) ever wrote a cross-tenant
+  // transition, cleanup must still succeed instead of tripping the FK.
+  await pool.query(`DELETE FROM stage_transitions WHERE workspace_id = $1
+                    OR opportunity_id IN (SELECT id FROM opportunities WHERE workspace_id = $1)`, [ws]);
   await pool.query(`DELETE FROM bulk_job_items WHERE job_id IN (SELECT id FROM bulk_jobs WHERE workspace_id = $1)`, [ws]);
   await pool.query(`DELETE FROM bulk_jobs WHERE workspace_id = $1`, [ws]);
   await pool.query(`DELETE FROM opportunities WHERE workspace_id = $1`, [ws]);

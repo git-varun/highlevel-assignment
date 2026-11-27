@@ -6,6 +6,12 @@ set -u
 cd "$(dirname "$0")/.."
 if ! git diff --quiet -- src; then echo "src/ has uncommitted changes; commit or stash first"; exit 2; fi
 
+# A failing test only means something if the same test PASSES on the real code.
+# Without this baseline, a broken suite would report every mutation as "caught".
+echo "baseline: full suite on unmodified code…"
+if ! npm test >/dev/null 2>&1; then echo "baseline FAILED — fix the suite first; mutation results would be meaningless"; exit 2; fi
+echo "baseline green\n"
+
 caught=0; missed=0
 mutate() { # $1 label, $2 file, $3 sed expression, $4 test file, $5 test name pattern
   sed -i "$3" "$2"
@@ -54,4 +60,9 @@ mutate "tenant scoping on single move (404 across workspaces)" src/domain/opport
   test/api.test.js 'tenancy'
 
 echo "\n$caught caught, $missed missed"
+
+# Mutated code can write data the real code never would (e.g. a cross-tenant row).
+# Prove the suite is still green afterwards, i.e. nothing leaked into later runs.
+echo "after: full suite on restored code…"
+if npm test >/dev/null 2>&1; then echo "after green"; else echo "after FAILED — a mutation leaked state"; exit 1; fi
 [ "$missed" -eq 0 ]
