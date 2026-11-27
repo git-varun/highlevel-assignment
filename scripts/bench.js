@@ -120,11 +120,17 @@ async function main() {
 
   const api = start('src/api/server.js'); await waitApi();
 
+  // Measuring right after a 515k-row reseed is measuring autovacuum and cold caches, not
+  // the system: one run produced a baseline p99 WORSE than under bulk load. Settle first.
+  console.log('settling: VACUUM ANALYZE + 5s discarded warm-up…');
+  await pool.query('VACUUM ANALYZE');
+  await measure(classes, () => sleep(5000));
+
   console.log(`baseline: ${BASELINE_SECONDS}s of interactive load, no bulk job…`);
   results.baseline = await measure(classes, () => sleep(BASELINE_SECONDS * 1000));
 
   const target = (await q1(`SELECT id FROM stages WHERE workspace_id = $1 AND name = 'On Hold'`, [BIG_WS])).id;
-  for (const [label, rate, stage] of [['paced', '5000', 'Contacted'], ['unpaced', '0', 'Discovery']]) {
+  for (const [label, rate, stage] of [['paced', process.env.BENCH_PACED_RATE ?? '5000', 'Contacted'], ['unpaced', '0', 'Discovery']]) {
     console.log(`bulk move 50k (${label}) under interactive load…`);
     const { filter } = await fiftyK(stage);
     const worker = start('src/worker/index.js', { BULK_RATE_PER_SEC: rate });
@@ -173,36 +179,47 @@ async function main() {
 
 const f = (n, d = 1) => (Number.isFinite(n) ? n.toFixed(d) : 'n/a');
 function latRow(name, l) { return `| ${name} | ${l.n} | ${f(l.p50)} | ${f(l.p95)} | ${f(l.p99)} | ${f(l.max)} | ${l.errors} |`; }
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+// Stress runs: every bench/results-<tag>.json except the main one, shown side by side so
+// run-to-run variance is visible. Conclusions below are worded from these numbers.
 function stressSection() {
-  if (!existsSync('bench/results-stress.json')) return '';
-  const s = JSON.parse(readFileSync('bench/results-stress.json', 'utf8'));
-  const pctChange = (a, b) => `${b >= a ? '+' : ''}${(((b - a) / a) * 100).toFixed(0)}%`;
-  const row = (name, l, base) => `| ${name} | ${f(l.p95)} (${pctChange(base.p95, l.p95)}) | ${f(l.p99)} (${pctChange(base.p99, l.p99)}) | ${l.errors} |`;
+  const runs = (existsSync('bench') ? readdirSync('bench') : [])
+    .filter((n) => /^results-.+\.json$/.test(n)).sort()
+    .map((n) => ({ tag: n.slice(8, -5), r: JSON.parse(readFileSync(`bench/${n}`, 'utf8')) }));
+  if (!runs.length) return '';
+  const d = (base, l) => `${b(l.p95)} (${pc(base.p95, l.p95)})`;
+  const b = (x) => f(x);
+  const pc = (a, x) => `${x >= a ? '+' : ''}${(((x - a) / a) * 100).toFixed(0)}%`;
+  const rows = runs.flatMap(({ tag, r }) => [
+    `| ${tag} | paced @ ${r.paced.ratePerSec}/s | ${f(r.paced.seconds)} s | ${b(r.baseline.sameWorkspace.p95)} | ${d(r.baseline.sameWorkspace, r.paced.latency.sameWorkspace)} | ${d(r.baseline.otherWorkspace, r.paced.latency.otherWorkspace)} |`,
+    `| ${tag} | unpaced | ${f(r.unpaced.seconds)} s | ${b(r.baseline.sameWorkspace.p95)} | ${d(r.baseline.sameWorkspace, r.unpaced.latency.sameWorkspace)} | ${d(r.baseline.otherWorkspace, r.unpaced.latency.otherWorkspace)} |`,
+  ]);
   return `
-### 2b. Stress run: ${s.config.rps} req/s per workspace class (\`BENCH_TAG=stress BENCH_RPS=${s.config.rps} npm run bench\`)
+### 2b. Stress runs (${runs[0].r.config.rps} req/s per workspace class)
 
-At the light load above the machine is not saturated, so pacing has nothing to protect.
-This run raises interactive load until the bulk job's cost becomes visible.
+\`BENCH_TAG=<tag> BENCH_RPS=200 BENCH_PACED_RATE=<rate> npm run bench\`. At the light load
+above the machine is not saturated, so there is nothing for pacing to protect. Each tag is
+one complete run (own baseline); two runs per rate show the run-to-run variance.
 
-| Scenario | p95 ms (vs baseline) | p99 ms (vs baseline) | errors |
-|---|---|---|---|
-| Baseline — same workspace | ${f(s.baseline.sameWorkspace.p95)} | ${f(s.baseline.sameWorkspace.p99)} | ${s.baseline.sameWorkspace.errors} |
-${row('Paced — same workspace', s.paced.latency.sameWorkspace, s.baseline.sameWorkspace)}
-${row('Unpaced — same workspace', s.unpaced.latency.sameWorkspace, s.baseline.sameWorkspace)}
-| Baseline — other workspace | ${f(s.baseline.otherWorkspace.p95)} | ${f(s.baseline.otherWorkspace.p99)} | ${s.baseline.otherWorkspace.errors} |
-${row('Paced — other workspace', s.paced.latency.otherWorkspace, s.baseline.otherWorkspace)}
-${row('Unpaced — other workspace', s.unpaced.latency.otherWorkspace, s.baseline.otherWorkspace)}
-
-Bulk wall-clock in this run: paced ${f(s.paced.seconds)} s (${f(s.paced.throughput, 0)}/s), unpaced ${f(s.unpaced.seconds)} s (${f(s.unpaced.throughput, 0)}/s); all verified ${s.paced.verified && s.unpaced.verified ? '✅' : '❌'}.
+| Run | Bulk job | Wall-clock | Baseline p95 ms (same ws) | During bulk p95 ms — same ws | During bulk p95 ms — other ws |
+|---|---|---|---|---|---|
+${rows.join('\n')}
 
 **Reading it honestly:**
-- Pacing is a real, measured trade-off: unpaced finishes ~${f(s.paced.seconds / s.unpaced.seconds)}× faster but raises
-  same-workspace p95 by ${pctChange(s.baseline.sameWorkspace.p95, s.unpaced.latency.sameWorkspace.p95)}; paced keeps the increase to ${pctChange(s.baseline.sameWorkspace.p95, s.paced.latency.sameWorkspace.p95)}.
-- The OTHER workspace moves about as much as the same one. Application-level isolation
-  (separate pools, one running job per workspace, per-job pacing) holds, but every tenant
-  shares one Postgres and — here — 2 CPUs. That shared database is the hole the isolation
-  mechanism still leaves; see DESIGN.md.
+- A bulk job raises interactive p95 by a few milliseconds here, in the job's workspace AND in
+  the other one. Pacing at 5,000 deals/s is *not* slow enough on this 2-core machine to change
+  that — it mostly spreads the same per-chunk cost over a longer time.
+- Pacing at 1,000 deals/s reduces the impact measurably in both runs, at the price of a job
+  that takes ~9× longer. The right rate is a per-deployment tuning knob
+  (\`BULK_RATE_PER_SEC\`), not a constant; an adaptive limiter driven by database latency is
+  the better long-term answer (see DESIGN.md).
+- The other workspace is affected about as much as the job's own. Application-level isolation
+  (separate pools, one running job per workspace, per-job pacing, round-robin claims) holds,
+  but every tenant shares one Postgres and, here, 2 CPUs: that is the hole the isolation
+  mechanism still leaves.
+- An earlier version of this benchmark measured the baseline straight after reseeding and
+  reported pacing at 5,000/s as clearly better. That baseline was polluted (autovacuum, cold
+  caches); with a settled baseline the difference disappeared, so the claim was withdrawn.
 `;
 }
 
@@ -271,6 +288,9 @@ ${Object.entries(r.killResume.checks).map(([k, v]) => `- ${v ? '✅' : '❌'} ${
   price of crash detection without a coordinator; a shorter lease detects faster but risks
   reclaiming a job from a worker that is merely slow.
 - Single runs, not averages: expect ± variation between runs.
+- Before the baseline the script runs \`VACUUM ANALYZE\` and a 5 s discarded warm-up: measuring
+  straight after the reseed produced a baseline p99 worse than under bulk load (autovacuum and
+  cold caches), which made every "vs baseline" comparison meaningless.
 `;
 }
 

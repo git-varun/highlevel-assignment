@@ -1,0 +1,109 @@
+{
+  "when": "2026-11-27T14:29:03.451Z",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cores": 2,
+    "ramGiB": "7.8",
+    "os": "Linux 6.18.44-fc-v880",
+    "node": "v22.23.5",
+    "postgres": "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
+    "cpuMHz": 0,
+    "loadAvg": "0.63 0.52 0.24",
+    "container": "n/a",
+    "note": "API, worker, load generator and Postgres all on this one machine (they compete for CPU)."
+  },
+  "config": {
+    "rps": 200,
+    "lease": 10,
+    "chunk": 500
+  },
+  "baseline": {
+    "sameWorkspace": {
+      "n": 2876,
+      "p50": 2.193537999999535,
+      "p95": 5.705057999999553,
+      "p99": 12.718680000001768,
+      "max": 62.157075999999506,
+      "errors": 0
+    },
+    "otherWorkspace": {
+      "n": 2876,
+      "p50": 2.179552000001422,
+      "p95": 5.731461999999738,
+      "p99": 12.441459000001487,
+      "max": 65.51982700000008,
+      "errors": 0
+    }
+  },
+  "paced": {
+    "ratePerSec": 5000,
+    "total": 49990,
+    "submitMs": 282.7314640000004,
+    "seconds": 9.990916,
+    "throughput": 5003.545220478282,
+    "verified": true,
+    "latency": {
+      "sameWorkspace": {
+        "n": 2003,
+        "p50": 2.379758999999467,
+        "p95": 8.940545999997994,
+        "p99": 19.04411500000424,
+        "max": 72.92588400000386,
+        "errors": 0
+      },
+      "otherWorkspace": {
+        "n": 2003,
+        "p50": 2.3963389999989886,
+        "p95": 8.745341000001645,
+        "p99": 19.718659000001935,
+        "max": 71.80371999999625,
+        "errors": 0
+      }
+    }
+  },
+  "unpaced": {
+    "ratePerSec": "unlimited",
+    "total": 49990,
+    "submitMs": 308.10767699999997,
+    "seconds": 5.214705,
+    "throughput": 9586.352439879149,
+    "verified": true,
+    "latency": {
+      "sameWorkspace": {
+        "n": 1119,
+        "p50": 2.4073350000035134,
+        "p95": 8.036772999999812,
+        "p99": 16.52947100000165,
+        "max": 62.32862100000057,
+        "errors": 0
+      },
+      "otherWorkspace": {
+        "n": 1119,
+        "p50": 2.544175000002724,
+        "p95": 9.26719299999968,
+        "p99": 18.47207999999955,
+        "max": 62.81694499999867,
+        "errors": 0
+      }
+    }
+  },
+  "killResume": {
+    "total": 49990,
+    "appliedAtKill": 30000,
+    "secondsKillToDone": 14.181286283999995,
+    "attempt": 2,
+    "failures": 1,
+    "verified": true,
+    "checks": {
+      "job status is completed": true,
+      "no pending items": true,
+      "applied + skipped = total": true,
+      "job counters match item rows": true,
+      "one transition per applied item": true,
+      "no duplicate transitions": true,
+      "applied deals are in target stage (or moved again later)": true,
+      "every skip was a real concurrent modification": true
+    },
+    "resumedFrom": "301888"
+  }
+}

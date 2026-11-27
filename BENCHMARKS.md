@@ -18,8 +18,8 @@ API, worker, load generator and Postgres all on this one machine (they compete f
 
 | Run | Pacing | Deals | Submit (snapshot) | Wall-clock | Sustained throughput | Verified |
 |---|---|---|---|---|---|---|
-| paced | 5000/s per job | 49990 | 324 ms | 9.9 s | 5024 deals/s | ✅ all invariants |
-| unpaced | unlimited | 49990 | 342 ms | 4.8 s | 10307 deals/s | ✅ all invariants |
+| paced | 5000/s per job | 49990 | 307 ms | 10.0 s | 5011 deals/s | ✅ all invariants |
+| unpaced | unlimited | 49990 | 280 ms | 5.7 s | 8749 deals/s | ✅ all invariants |
 
 Wall-clock = `finished_at − started_at` from the database (excludes the submit request).
 Chunk size 500, one running job per workspace, worker pool of 4 connections.
@@ -31,36 +31,45 @@ moves on random deals — some of them inside the job's set), fired on a fixed s
 
 | Scenario | Requests | p50 | p95 | p99 | max | 5xx/errors |
 |---|---|---|---|---|---|---|
-| Baseline — same workspace (no bulk job) | 594 | 3.3 | 7.9 | 12.6 | 26.8 | 0 |
-| Baseline — other workspace (no bulk job) | 594 | 3.3 | 7.6 | 12.9 | 46.5 | 0 |
-| Paced bulk — same workspace | 422 | 2.8 | 8.3 | 14.7 | 91.0 | 0 |
-| Paced bulk — other workspace | 421 | 2.6 | 7.8 | 13.2 | 19.4 | 0 |
-| Unpaced bulk — same workspace | 218 | 2.4 | 7.2 | 9.4 | 21.3 | 0 |
-| Unpaced bulk — other workspace | 218 | 2.4 | 6.3 | 8.7 | 17.6 | 0 |
+| Baseline — same workspace (no bulk job) | 595 | 2.6 | 5.8 | 8.4 | 11.8 | 0 |
+| Baseline — other workspace (no bulk job) | 594 | 2.5 | 6.0 | 10.6 | 17.7 | 0 |
+| Paced bulk — same workspace | 420 | 2.8 | 9.6 | 13.7 | 20.1 | 0 |
+| Paced bulk — other workspace | 420 | 2.6 | 8.7 | 15.4 | 41.5 | 0 |
+| Unpaced bulk — same workspace | 252 | 2.5 | 8.0 | 10.2 | 12.6 | 0 |
+| Unpaced bulk — other workspace | 251 | 2.8 | 8.1 | 14.3 | 43.3 | 0 |
 
-### 2b. Stress run: 200 req/s per workspace class (`BENCH_TAG=stress BENCH_RPS=200 npm run bench`)
+### 2b. Stress runs (200 req/s per workspace class)
 
-At the light load above the machine is not saturated, so pacing has nothing to protect.
-This run raises interactive load until the bulk job's cost becomes visible.
+`BENCH_TAG=<tag> BENCH_RPS=200 BENCH_PACED_RATE=<rate> npm run bench`. At the light load
+above the machine is not saturated, so there is nothing for pacing to protect. Each tag is
+one complete run (own baseline); two runs per rate show the run-to-run variance.
 
-| Scenario | p95 ms (vs baseline) | p99 ms (vs baseline) | errors |
-|---|---|---|---|
-| Baseline — same workspace | 9.7 | 21.9 | 0 |
-| Paced — same workspace | 11.3 (+16%) | 21.3 (-3%) | 0 |
-| Unpaced — same workspace | 15.0 (+54%) | 29.0 (+33%) | 0 |
-| Baseline — other workspace | 9.5 | 19.5 | 0 |
-| Paced — other workspace | 12.2 (+28%) | 23.8 (+22%) | 0 |
-| Unpaced — other workspace | 13.8 (+44%) | 29.2 (+50%) | 0 |
-
-Bulk wall-clock in this run: paced 10.0 s (4978/s), unpaced 2.9 s (17217/s); all verified ✅.
+| Run | Bulk job | Wall-clock | Baseline p95 ms (same ws) | During bulk p95 ms — same ws | During bulk p95 ms — other ws |
+|---|---|---|---|---|---|
+| 1k-run1 | paced @ 1000/s | 49.6 s | 5.8 | 7.4 (+27%) | 7.4 (+30%) |
+| 1k-run1 | unpaced | 5.8 s | 5.8 | 8.3 (+44%) | 8.0 (+40%) |
+| 1k-run2 | paced @ 1000/s | 49.6 s | 6.0 | 7.0 (+17%) | 7.0 (+16%) |
+| 1k-run2 | unpaced | 5.6 s | 6.0 | 13.2 (+120%) | 12.0 (+98%) |
+| 5k-run1 | paced @ 5000/s | 10.0 s | 5.7 | 8.9 (+57%) | 8.7 (+53%) |
+| 5k-run1 | unpaced | 5.2 s | 5.7 | 8.0 (+41%) | 9.3 (+62%) |
+| 5k-run2 | paced @ 5000/s | 10.0 s | 6.6 | 10.8 (+65%) | 10.4 (+49%) |
+| 5k-run2 | unpaced | 5.1 s | 6.6 | 9.5 (+45%) | 8.3 (+19%) |
 
 **Reading it honestly:**
-- Pacing is a real, measured trade-off: unpaced finishes ~3.5× faster but raises
-  same-workspace p95 by +54%; paced keeps the increase to +16%.
-- The OTHER workspace moves about as much as the same one. Application-level isolation
-  (separate pools, one running job per workspace, per-job pacing) holds, but every tenant
-  shares one Postgres and — here — 2 CPUs. That shared database is the hole the isolation
-  mechanism still leaves; see DESIGN.md.
+- A bulk job raises interactive p95 by a few milliseconds here, in the job's workspace AND in
+  the other one. Pacing at 5,000 deals/s is *not* slow enough on this 2-core machine to change
+  that — it mostly spreads the same per-chunk cost over a longer time.
+- Pacing at 1,000 deals/s reduces the impact measurably in both runs, at the price of a job
+  that takes ~9× longer. The right rate is a per-deployment tuning knob
+  (`BULK_RATE_PER_SEC`), not a constant; an adaptive limiter driven by database latency is
+  the better long-term answer (see DESIGN.md).
+- The other workspace is affected about as much as the job's own. Application-level isolation
+  (separate pools, one running job per workspace, per-job pacing, round-robin claims) holds,
+  but every tenant shares one Postgres and, here, 2 CPUs: that is the hole the isolation
+  mechanism still leaves.
+- An earlier version of this benchmark measured the baseline straight after reseeding and
+  reported pacing at 5,000/s as clearly better. That baseline was polluted (autovacuum, cold
+  caches); with a settled baseline the difference disappeared, so the claim was withdrawn.
 
 ## 3. Kill and resume
 
@@ -92,3 +101,6 @@ Proof of correctness (`scripts/verify-job.js`, computed from raw tables, not the
   price of crash detection without a coordinator; a shorter lease detects faster but risks
   reclaiming a job from a worker that is merely slow.
 - Single runs, not averages: expect ± variation between runs.
+- Before the baseline the script runs `VACUUM ANALYZE` and a 5 s discarded warm-up: measuring
+  straight after the reseed produced a baseline p99 worse than under bulk load (autovacuum and
+  cold caches), which made every "vs baseline" comparison meaningless.
