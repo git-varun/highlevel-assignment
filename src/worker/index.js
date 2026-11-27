@@ -8,7 +8,7 @@ import {
   LostOwnershipError, LEASE_SECONDS,
 } from './jobs.js';
 
-const cfg = {
+const defaults = {
   concurrency: Number(process.env.WORKER_CONCURRENCY ?? 2),     // jobs in parallel (different workspaces)
   chunkSize: Number(process.env.CHUNK_SIZE ?? 500),
   ratePerSec: Number(process.env.BULK_RATE_PER_SEC ?? 5_000),   // per job; 0 = unlimited
@@ -16,7 +16,9 @@ const cfg = {
   reapEveryMs: 10_000,
 };
 
-export function startWorker(pool, { id = `${os.hostname()}:${process.pid}`, log = console.log } = {}) {
+// Overrides let tests run an in-process worker with e.g. 1 slot and tiny chunks.
+export function startWorker(pool, { id = `${os.hostname()}:${process.pid}`, log = console.log, ...overrides } = {}) {
+  const cfg = { ...defaults, ...overrides };
   let stopping = false;
 
   async function processJob(job) {
@@ -99,7 +101,7 @@ export function startWorker(pool, { id = `${os.hostname()}:${process.pid}`, log 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const pool = createPool('worker');
   const w = startWorker(pool);
-  console.log(`[worker] started`, cfg);
+  console.log(`[worker] started`, defaults);
   for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, async () => {
       console.log(`[worker] ${sig}: finishing current chunk, handing jobs back`);
