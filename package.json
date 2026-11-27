@@ -1,0 +1,22 @@
+{
+  "name": "bulk-stage-move",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Opportunities bulk stage move: idempotent, resumable, concurrency-safe background job on Postgres",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "migrate": "node scripts/migrate.js",
+    "seed": "node scripts/seed.js",
+    "api": "node src/api/server.js",
+    "worker": "node src/worker/index.js",
+    "test": "node --test --test-concurrency=1 test/"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0"
+  }
+}
