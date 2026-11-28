@@ -6,7 +6,7 @@ Node.js 22 · Express 5 · PostgreSQL 16, which is both the datastore and the qu
 
 | | |
 |---|---|
-| 🌐 Deployed | _TODO: add URL_ |
+| 🌐 Deployed | [AWS EC2](http://3.7.248.97:3000/)|
 | 🎥 Video | [Loom Video](https://www.loom.com/share/8062345948094dfc9f4cf791e111ec2a) |
 | 📐 Design | [DESIGN.md](DESIGN.md) |
 | 📊 Benchmarks | [BENCHMARKS.md](BENCHMARKS.md) |
